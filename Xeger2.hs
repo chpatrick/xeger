@@ -44,11 +44,10 @@ data MatchContext = MatchContext
 
 makeLenses ''MatchContext
 
-newtype MatchState = MatchState ( SIndex )
+newtype MatchState = MatchState { _matchPos :: SIndex }
   deriving ( Show, Mergeable )
 
-matchPos :: Lens' MatchState SIndex
-matchPos = lens (\(MatchState p) -> p) (\_ p -> MatchState p)
+makeLenses ''MatchState
 
 newtype SAnd = SAnd SBool
   deriving (Boolean, Mergeable)
@@ -76,13 +75,12 @@ instance Mergeable r => MonadPlus (Match r) where
   mplus = (<|>)
 
 runMatch :: GetChar -> Int -> Match a a -> SBool
-runMatch gc n (Match m)
-  = case execRWST (runContT m return) ctx s of
+runMatch gc n (Match m) =
+  let ctx = MatchContext { _matchLength = n, _charF = gc }
+      s = MatchState 0
+  in case execRWST (runContT m return) ctx s of
       Just ( _, SAnd p ) -> p
       Nothing -> false
-  where
-    ctx = MatchContext { _matchLength = n, _charF = gc }
-    s = MatchState 0
 
 sguard :: SBool -> Match r ()
 sguard = Match . lift . tell . SAnd
@@ -112,6 +110,24 @@ eof = do
   len <- view matchLength
   sguard $ p .== int len
 
+data Group = Group { groupStart :: SIndex, groupLength :: SIndex }
+
+group :: Match r () -> Match r Group
+group m = do
+  start <- use matchPos
+  m
+  end <- use matchPos
+  return $ Group start (end - start)
+
+backref :: Group -> Match r ()
+backref Group { groupStart = gstart, groupLength = glen } = do
+  pos <- use matchPos
+  len <- view matchLength
+  gc <- view charF
+  let is = map int [0..len - 1]
+  sguard $ pos + glen .<= int len &&& bAll (\i -> i .< glen ==> gc (pos + i) .== gc (gstart + i)) is
+  matchPos += glen
+
 -- puzzle types
 
 type Puzzle c = ( Predicate, [ ( c, String ) ] )
@@ -123,12 +139,12 @@ linear n m
       charVars = [ ( i, "char_" ++ show i ) | i <- [0..n - 1] ]
       p = do
         chars :: SArray SymIndex Char <- newArray_ Nothing
-        let char = readArray chars
-            p = runMatch char n (m >> eof)
+        let getc = readArray chars
+            pp = runMatch getc n (m >> eof)
         vps <- for charVars $ \( i, vn ) -> do
           v <- free vn
-          return $ v .== char (int i)
-        return $ p &&& bAnd vps
+          return $ v .== getc (int i)
+        return $ pp &&& bAnd vps
 
 -- Solving
 getResultChars :: SatResult -> [ ( c, String ) ] -> Maybe [ ( c, Char ) ]
