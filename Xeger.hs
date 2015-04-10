@@ -1,4 +1,4 @@
-{-# LANGUAGE GeneralizedNewtypeDeriving, NamedFieldPuns, TemplateHaskell, ScopedTypeVariables, TupleSections, OverloadedStrings, LambdaCase #-}
+module Xeger where
 
 import Control.Applicative hiding (some, many)
 import Data.Char
