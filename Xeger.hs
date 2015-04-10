@@ -73,7 +73,7 @@ newtype Match r a = Match (ContT r (RWST MatchContext SAnd MatchState Maybe) a)
   deriving (Functor, Applicative, Monad, MonadReader MatchContext, MonadState MatchState)
 
 instance Mergeable r => Alternative (Match r) where
-  empty = Match $ ContT $ \_ -> empty
+  empty = Match $ ContT $ const empty
   Match l <|> Match r
     = Match $ ContT $ \cc -> RWST $ \ctx s ->
       let run m = runRWST (runContT m cc) ctx s
@@ -171,18 +171,19 @@ crossword horizPs vertPs
       charVars = [ ( ( x, y ), "char_" ++ show x ++ "_" ++ show y ) | y <- [0..height - 1], x <- [0..width - 1] ]
       p = do
         chars :: SArray SymIndex Char <- newArray_ Nothing
-        let char = readArray chars
+        let getc = readArray chars
+            coords = [0 :: Int ..]
             horizPreds = [ runMatch getColumn height (hp >> eof)
-                         | ( x, hp ) <- zip [0..] horizPs
-                         , let getColumn y = char (int width * y + int x)
+                         | ( x, hp ) <- zip coords horizPs
+                         , let getColumn y = getc (int width * y + int x)
                          ]
             vertPreds = [ runMatch getRow width (vp >> eof)
-                        | ( y, vp ) <- zip [0..] vertPs
-                        , let getRow x = char (int (width * y) + x)
+                        | ( y, vp ) <- zip coords vertPs
+                        , let getRow x = getc (int (width * y) + x)
                         ]
         vps <- for charVars $ \( ( x, y ), vn ) -> do
           v <- free vn
-          return $ v .== char (int (y * width + x))
+          return $ v .== getc (int (y * width + x))
         return $ bAnd horizPreds &&& bAnd vertPreds &&& bAnd vps
 
 -- Solving
@@ -220,7 +221,7 @@ patternSetChars (PatternSet (Just scs) Nothing Nothing Nothing)
 patternSetChars _ = error "Unsupported pattern set."
 
 regex :: Mergeable r => Pattern -> Match r ()
-regex p = evalStateT (matchPat (starTrans p)) IM.empty
+regex pat = evalStateT (matchPat (starTrans pat)) IM.empty
   where
     matchPat = \case
       PEmpty -> return ()
@@ -254,12 +255,12 @@ regex p = evalStateT (matchPat (starTrans p)) IM.empty
             Nothing -> empty
         'd' -> lift $ oneOf ['0'..'9']
       PNonCapture p -> matchPat p
-      pat -> error $ "Unsupported pattern: " ++ show pat
+      x -> error $ "Unsupported pattern: " ++ show x
 
 --
 
 doCrossword :: [ Pattern ] -> [ Pattern ] -> IO ()
-doCrossword horizPs vertPs = do
+doCrossword horizPs vertPs =
   satChars (crossword (map regex horizPs) (map regex vertPs)) >>= \case
     Nothing -> putStrLn "No solution found :("
     Just ls -> putStr $ unlines
@@ -271,21 +272,31 @@ doCrossword horizPs vertPs = do
 
 type Challenge = ( [ String ], [ String ] )
 
+parseChallenge :: Object -> Parser ( String, Challenge )
+parseChallenge puzz = do
+  pn <- puzz .: "name"
+  patternsX <- puzz .: "patternsX"
+  patternsY <- puzz .: "patternsY"
+  return ( T.unpack pn, ( map (T.unpack . V.head) patternsX, map (T.unpack . V.head) patternsY ) )
+
 parseChallenges :: [ Object ] -> Parser [ ( String, Challenge ) ]
 parseChallenges cSets = do
   pSets <- for (cSets :: [Object]) $ \cSet -> do
     ps <- cSet .: "puzzles"
-    for (ps :: [Object]) $ \puzz -> do
-      pn <- puzz .: "name"
-      patternsX <- puzz .: "patternsX"
-      patternsY <- puzz .: "patternsY"
-      return ( T.unpack pn, ( map (T.unpack . V.head) patternsX, map (T.unpack . V.head) patternsY ) )
+    for (ps :: [Object]) parseChallenge
   return $ concat pSets
 
 doChallenge :: String -> IO ()
-doChallenge name = do
+doChallenge puzzleName = do
   cjson <- simpleHttp "http://regexcrossword.com/data/challenges.json"
   let Just cSets = decode cjson
       Just challenges = parseMaybe parseChallenges cSets
-      Just ( h, v ) = lookup name challenges
+      Just ( h, v ) = lookup puzzleName challenges
+  doCrossword (map fromString h) (map fromString v)
+
+doPlayerChallenge :: String -> IO ()
+doPlayerChallenge puzzleId = do
+  cjson <- simpleHttp $ "http://regexcrossword.com/api/puzzles?puzzle_id=" ++ puzzleId
+  let Just c = decode cjson
+      Just ( _, ( h, v ) ) = parseMaybe parseChallenge c
   doCrossword (map fromString h) (map fromString v)
