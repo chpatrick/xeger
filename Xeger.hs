@@ -84,11 +84,12 @@ instance Mergeable r => MonadPlus (Match r) where
   mzero = empty
   mplus = (<|>)
 
-runMatch :: GetChar -> Int -> Match a a -> SBool
-runMatch gc n (Match m) =
+runMatch :: GetChar -> Int -> Match () a -> SBool
+runMatch gc n m =
   let ctx = MatchContext { _matchLength = n, _charF = gc }
       s = MatchState 0
-  in case execRWST (runContT m return) ctx s of
+      Match cm = m >> eof
+  in case execRWST (runContT cm return) ctx s of
       Just ( _, SAnd p ) -> p
       Nothing -> false
 
@@ -156,7 +157,7 @@ linear n m
       p = do
         chars :: SArray SymIndex Char <- newArray_ Nothing
         let getc = readArray chars
-            pp = runMatch getc n (m >> eof)
+            pp = runMatch getc n m
         vps <- for charVars $ \( i, vn ) -> do
           v <- free vn
           return $ v .== getc (int i)
