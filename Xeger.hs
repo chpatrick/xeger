@@ -4,8 +4,8 @@ import Control.Applicative hiding (some, many)
 import Data.Char
 import Control.Lens
 import Control.Monad.Cont
-import Control.Monad.RWS
-import Control.Monad.State
+import Control.Monad.RWS.Strict hiding (Alt)
+import Control.Monad.State.Strict
 import Data.Aeson hiding ((.=))
 import Data.Aeson.Types hiding ((.=))
 import Data.Foldable
@@ -69,34 +69,36 @@ instance Monoid SAnd where
   mempty = true
   mappend = (&&&)
 
-newtype Match r a = Match (ContT r (RWST MatchContext SAnd MatchState Maybe) a)
+newtype Match a = Match (ContT () (RWS MatchContext SAnd MatchState) a)
   deriving (Functor, Applicative, Monad, MonadReader MatchContext, MonadState MatchState)
 
-instance Mergeable r => Alternative (Match r) where
-  empty = Match $ ContT $ const empty
+instance Alternative Match where
+  empty = Match $ ContT $ const (tell false)
   Match l <|> Match r
-    = Match $ ContT $ \cc -> RWST $ \ctx s ->
-      let run m = runRWST (runContT m cc) ctx s
-          sChoose lr @ ( _, _, SAnd p ) = ite p lr
-      in sChoose <$> run l <*> run r <|> run l <|> run r
+    = Match $ ContT $ \cc -> rws $ \ctx s ->
+      let run m = runRWS (runContT m cc) ctx s
+      in case run l of
+        ( _, _, SAnd p ) -> ite p (run l) (run r)
 
-instance Mergeable r => MonadPlus (Match r) where
+instance MonadPlus Match where
   mzero = empty
   mplus = (<|>)
 
-runMatch :: GetChar -> Int -> Match () a -> SBool
+runMatch :: GetChar -> Int -> Match a -> SBool
 runMatch gc n m =
   let ctx = MatchContext { _matchLength = n, _charF = gc }
       s = MatchState 0
       Match cm = m >> eof
-  in case execRWST (runContT cm return) ctx s of
-      Just ( _, SAnd p ) -> p
-      Nothing -> false
+  in case execRWS (runContT cm return) ctx s of
+      ( _, SAnd p ) -> p
 
-sguard :: SBool -> Match r ()
+sguard :: SBool -> Match ()
 sguard = Match . lift . tell . SAnd
 
-anyChar :: Match r SChar
+szero :: Match ()
+szero = sguard false
+
+anyChar :: Match SChar
 anyChar = do
   p <- use matchPos
   len <- view matchLength
@@ -105,20 +107,20 @@ anyChar = do
   matchPos .= p + 1
   return (gc p)
 
-char :: Char -> Match r ()
+char :: Char -> Match ()
 char pc = anyChar >>= \c -> sguard $ c .== literal pc
 
-oneOf :: [ Char ] -> Match r ()
+oneOf :: [ Char ] -> Match ()
 oneOf pcs = anyChar >>= \c -> sguard $ c `sElem` map literal pcs
 
-many :: Mergeable r => Match r () -> Match r ()
+many :: Match () -> Match ()
 many m = do
   depth <- view matchLength
   let star' 0 = return ()
       star' n = (m >> star' (n - 1)) <|> return ()
   star' depth
 
-eof :: Match r ()
+eof :: Match ()
 eof = do
   p <- use matchPos
   len <- view matchLength
@@ -126,17 +128,17 @@ eof = do
 
 data Group = Group { groupStart :: SIndex, groupLength :: SIndex }
 
-group :: Match r a -> Match r ( a, Group )
+group :: Match a -> Match ( a, Group )
 group m = do
   start <- use matchPos
   x <- m
   end <- use matchPos
   return ( x, Group start (end - start) )
 
-group_ :: Match r a -> Match r Group
+group_ :: Match a -> Match Group
 group_ m = snd <$> group m
 
-backref :: Group -> Match r ()
+backref :: Group -> Match ()
 backref Group { groupStart = gstart, groupLength = glen } = do
   pos <- use matchPos
   len <- view matchLength
@@ -149,7 +151,7 @@ backref Group { groupStart = gstart, groupLength = glen } = do
 
 type Puzzle c = ( Predicate, [ ( c, String ) ] )
 
-linear :: Int -> Match () () -> Puzzle Int
+linear :: Int -> Match () -> Puzzle Int
 linear n m
   = ( p, charVars )
     where
@@ -163,7 +165,7 @@ linear n m
           return $ v .== getc (int i)
         return $ pp &&& bAnd vps
 
-crossword :: [ Match () () ] -> [ Match () () ] -> Puzzle ( Int, Int )
+crossword :: [ Match () ] -> [ Match () ] -> Puzzle ( Int, Int )
 crossword horizPs vertPs
   = ( p, charVars )
     where
@@ -221,7 +223,7 @@ patternSetChars (PatternSet (Just scs) Nothing Nothing Nothing)
   = S.toList scs
 patternSetChars _ = error "Unsupported pattern set."
 
-regex :: Mergeable r => Pattern -> Match r ()
+regex :: Pattern -> Match ()
 regex pat = evalStateT (matchPat (starTrans pat)) IM.empty
   where
     matchPat = \case
@@ -253,7 +255,7 @@ regex pat = evalStateT (matchPat (starTrans pat)) IM.empty
           m'g <- use $ at $ digitToInt esc
           case m'g of
             Just g -> lift $ backref g
-            Nothing -> empty
+            Nothing -> lift szero
         'd' -> lift $ oneOf ['0'..'9']
       PNonCapture p -> matchPat p
       x -> error $ "Unsupported pattern: " ++ show x
