@@ -29,7 +29,7 @@ library
                        regex-tdfa >=1.2.0,
                        http-conduit >=2.1.5,
                        text >= 1.2.0.4,
-                       sbv >= 4.2,
+                       sbv <= 4.2,
                        lens >= 4.9,
                        aeson >= 0.8.0.2
   -- hs-source-dirs:      

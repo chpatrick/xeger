@@ -95,9 +95,6 @@ runMatch gc n m =
 sguard :: SBool -> Match ()
 sguard = Match . lift . tell . SAnd
 
-szero :: Match ()
-szero = sguard false
-
 anyChar :: Match SChar
 anyChar = do
   p <- use matchPos
@@ -255,12 +252,12 @@ regex pat = evalStateT (matchPat (starTrans pat)) IM.empty
           m'g <- use $ at $ digitToInt esc
           case m'g of
             Just g -> lift $ backref g
-            Nothing -> lift szero
+            Nothing -> empty
         'd' -> lift $ oneOf ['0'..'9']
       PNonCapture p -> matchPat p
       x -> error $ "Unsupported pattern: " ++ show x
 
---
+-- Do a crossword
 
 doCrossword :: [ Pattern ] -> [ Pattern ] -> IO ()
 doCrossword horizPs vertPs =
