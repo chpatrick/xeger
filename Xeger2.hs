@@ -1,13 +1,26 @@
-{-# LANGUAGE GeneralizedNewtypeDeriving, NamedFieldPuns, TemplateHaskell, ScopedTypeVariables, TupleSections #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving, NamedFieldPuns, TemplateHaskell, ScopedTypeVariables, TupleSections, OverloadedStrings, LambdaCase #-}
 
 import Control.Applicative hiding (some, many)
+import Data.Char
 import Control.Lens
 import Control.Monad.Cont
 import Control.Monad.RWS
+import Control.Monad.State
+import Data.Aeson hiding ((.=))
+import Data.Aeson.Types hiding ((.=))
 import Data.Foldable
+import qualified Data.IntMap.Strict as IM
+import Data.Maybe
 import Data.SBV
 import Data.SBV.Internals (genMkSymVar, genLiteral, genFromCW)
+import qualified Data.Set as S
+import qualified Data.Text as T
+import qualified Data.Vector as V
+import Data.String
 import Data.Traversable
+import Network.HTTP.Conduit
+import Text.Regex.TDFA.Pattern
+import Text.Regex.TDFA.ReadRegex
 
 int :: (Integral i, Num a) => i -> a
 int = fromIntegral
@@ -63,12 +76,9 @@ instance Mergeable r => Alternative (Match r) where
   empty = Match $ ContT $ \_ -> empty
   Match l <|> Match r
     = Match $ ContT $ \cc -> RWST $ \ctx s ->
-      let run m = runRWST (runContT m cc) ctx s in
-      case ( run l, run r ) of
-        ( lr @ (Just ( _, _, SAnd p )), rr @ (Just _) ) -> ite p lr rr
-        ( lr @ (Just _), _ ) -> lr
-        ( _, rr @ (Just _) ) -> rr
-        _ -> Nothing
+      let run m = runRWST (runContT m cc) ctx s
+          sChoose lr @ ( _, _, SAnd p ) = ite p lr
+      in sChoose <$> run l <*> run r <|> run l <|> run r
 
 instance Mergeable r => MonadPlus (Match r) where
   mzero = empty
@@ -97,6 +107,9 @@ anyChar = do
 char :: Char -> Match r ()
 char pc = anyChar >>= \c -> sguard $ c .== literal pc
 
+oneOf :: [ Char ] -> Match r ()
+oneOf pcs = anyChar >>= \c -> sguard $ c `sElem` map literal pcs
+
 many :: Mergeable r => Match r () -> Match r ()
 many m = do
   depth <- view matchLength
@@ -112,12 +125,15 @@ eof = do
 
 data Group = Group { groupStart :: SIndex, groupLength :: SIndex }
 
-group :: Match r () -> Match r Group
+group :: Match r a -> Match r ( a, Group )
 group m = do
   start <- use matchPos
-  m
+  x <- m
   end <- use matchPos
-  return $ Group start (end - start)
+  return ( x, Group start (end - start) )
+
+group_ :: Match r a -> Match r Group
+group_ m = snd <$> group m
 
 backref :: Group -> Match r ()
 backref Group { groupStart = gstart, groupLength = glen } = do
@@ -146,18 +162,130 @@ linear n m
           return $ v .== getc (int i)
         return $ pp &&& bAnd vps
 
+crossword :: [ Match () () ] -> [ Match () () ] -> Puzzle ( Int, Int )
+crossword horizPs vertPs
+  = ( p, charVars )
+    where
+      width = length horizPs
+      height = length vertPs
+      charVars = [ ( ( x, y ), "char_" ++ show x ++ "_" ++ show y ) | y <- [0..height - 1], x <- [0..width - 1] ]
+      p = do
+        chars :: SArray SymIndex Char <- newArray_ Nothing
+        let char = readArray chars
+            horizPreds = [ runMatch getColumn height (hp >> eof)
+                         | ( x, hp ) <- zip [0..] horizPs
+                         , let getColumn y = char (int width * y + int x)
+                         ]
+            vertPreds = [ runMatch getRow width (vp >> eof)
+                        | ( y, vp ) <- zip [0..] vertPs
+                        , let getRow x = char (int (width * y) + x)
+                        ]
+        vps <- for charVars $ \( ( x, y ), vn ) -> do
+          v <- free vn
+          return $ v .== char (int (y * width + x))
+        return $ bAnd horizPreds &&& bAnd vertPreds &&& bAnd vps
+
 -- Solving
-getResultChars :: SatResult -> [ ( c, String ) ] -> Maybe [ ( c, Char ) ]
-getResultChars res@(SatResult (Satisfiable _ _)) vs
-  = for vs $ \( i, vn ) -> ( i, ) <$> getModelValue vn res
-getResultChars _ _ = Nothing
+getResultChars :: Modelable m => [ ( c, String ) ] -> m -> Maybe [ ( c, Char ) ]
+getResultChars vs m = do
+  guard (modelExists m)
+  for vs $ \( i, vn ) -> ( i, ) <$> getModelValue vn m
 
 satChars :: Puzzle c -> IO (Maybe [ ( c, Char ) ])
 satChars ( p, vs ) = do
   res <- sat p
-  return $ getResultChars res vs
+  return $ getResultChars vs res
+
+allSatChars :: Puzzle c -> IO [ [ ( c, Char ) ] ]
+allSatChars ( p, vs ) = do
+  AllSatResult ( _, ress ) <- allSat p
+  return $ mapMaybe (getResultChars vs) ress
 
 -- Utility
 dumpSMT :: Puzzle c -> IO ()
 dumpSMT ( p, _ )
   = compileToSMTLib True True p >>= putStr
+
+linAllChars :: IO [ [ ( Int, Char ) ] ] -> IO [ String ]
+linAllChars = fmap (map (map snd))
+
+-- Regex
+instance IsString Pattern where
+  fromString s = case parseRegex s of
+    Right ( p, _ ) -> p
+
+patternSetChars :: PatternSet -> [ Char ]
+patternSetChars (PatternSet (Just scs) Nothing Nothing Nothing)
+  = S.toList scs
+patternSetChars _ = error "Unsupported pattern set."
+
+regex :: Mergeable r => Pattern -> Match r ()
+regex p = evalStateT (matchPat (starTrans p)) IM.empty
+  where
+    matchPat = \case
+      PEmpty -> return ()
+      PGroup Nothing p -> matchPat p
+      PGroup (Just gi) p -> do
+        start <- lift $ use matchPos
+        matchPat p
+        end <- lift $ use matchPos
+        at gi .= Just (Group start (end - start))
+      POr ps -> asum $ map matchPat ps
+      PConcat ps -> traverse_ matchPat ps
+      PStar _ p -> do
+        depth <- lift $ view matchLength
+        let m = matchPat p
+            star' 0 = return ()
+            star' n = (m >> star' (n - 1)) <|> return ()
+        star' depth
+      PDot _ -> lift $ void anyChar
+      PAny _ ps -> lift $ oneOf $ patternSetChars ps
+      PAnyNot _ ps -> lift $ do
+        c <- anyChar
+        sguard $ bnot $ c `sElem` map literal (patternSetChars ps)
+      PChar _ pc -> lift $ do
+        c <- anyChar
+        sguard $ c .== literal pc
+      PEscape _ esc -> case esc of
+        _ | isDigit esc -> do
+          m'g <- use $ at $ digitToInt esc
+          case m'g of
+            Just g -> lift $ backref g
+            Nothing -> empty
+        'd' -> lift $ oneOf ['0'..'9']
+      PNonCapture p -> matchPat p
+      pat -> error $ "Unsupported pattern: " ++ show pat
+
+--
+
+doCrossword :: [ Pattern ] -> [ Pattern ] -> IO ()
+doCrossword horizPs vertPs = do
+  satChars (crossword (map regex horizPs) (map regex vertPs)) >>= \case
+    Nothing -> putStrLn "No solution found :("
+    Just ls -> putStr $ unlines
+      [ [ l | x <- [0..length horizPs - 1], let Just l = lookup ( x, y ) ls  ]
+      | y <- [0..length vertPs - 1]
+      ]
+
+-- regexcrosswords.com loading
+
+type Challenge = ( [ String ], [ String ] )
+
+parseChallenges :: [ Object ] -> Parser [ ( String, Challenge ) ]
+parseChallenges cSets = do
+  pSets <- for (cSets :: [Object]) $ \cSet -> do
+    ps <- cSet .: "puzzles"
+    for (ps :: [Object]) $ \puzz -> do
+      pn <- puzz .: "name"
+      patternsX <- puzz .: "patternsX"
+      patternsY <- puzz .: "patternsY"
+      return ( T.unpack pn, ( map (T.unpack . V.head) patternsX, map (T.unpack . V.head) patternsY ) )
+  return $ concat pSets
+
+doChallenge :: String -> IO ()
+doChallenge name = do
+  cjson <- simpleHttp "http://regexcrossword.com/data/challenges.json"
+  let Just cSets = decode cjson
+      Just challenges = parseMaybe parseChallenges cSets
+      Just ( h, v ) = lookup name challenges
+  doCrossword (map fromString h) (map fromString v)
